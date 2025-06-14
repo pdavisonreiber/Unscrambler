@@ -2,11 +2,17 @@ import argparse
 import os
 import datetime
 import yaml
-from PyPDF2 import PdfReader, PdfWriter
+import subprocess
+import tempfile
+import warnings
+from pypdf import PdfReader, PdfWriter
+
+# Filter out the specific warning about wrong pointing objects
+warnings.filterwarnings("ignore", message=".*Ignoring wrong pointing object.*")
 
 def cropPageLeft(page):
-	width = page.mediabox.lower_right[0]
-	height = page.mediabox.upper_left[1]
+	width = page.mediabox.right
+	height = page.mediabox.top
 	
 	if width > height:
 		page.cropbox.lower_left = (0, 0)
@@ -21,8 +27,8 @@ def cropPageLeft(page):
 		
 
 def cropPageRight(page):
-	width = page.mediabox.lower_right[0]
-	height = page.mediabox.upper_left[1]
+	width = page.mediabox.right
+	height = page.mediabox.top
 	
 	if width > height:
 		page.cropbox.lower_left = (width/2, 0)
@@ -57,8 +63,8 @@ def splitA3Booklet(document1, document2, pagesPerDocument):
 		raise Exception(f"Number of pages not divisible by {pagesPerDocument}.")
 	
 	page = document1.pages[0]
-	width = page.mediabox.lower_right[0]
-	height = page.mediabox.upper_left[1]
+	width = page.mediabox.right
+	height = page.mediabox.top
 	numDocs = numPages // pagesPerDocument
 	
 	arraysOfPages1 = [[document1.pages[i] for i in range(k * pagesPerDocument, (k + 1) * pagesPerDocument)] for k in range(numDocs)]
@@ -108,8 +114,8 @@ def scramble(document, pagesPerDocument, split=False, doublePage=False, doublePa
 			outputWriters[0].add_page(writer.pages[len(writer.pages) - 1])
 			
 			for i in range(1, len(writer.pages) // 2):
-				outputWriters[i].add_page(writer.get_page(2*i - 1))
-				outputWriters[i].add_page(writer.get_page(2*i))
+				outputWriters[i].add_page(writer.pages[2*i - 1])
+				outputWriters[i].add_page(writer.pages[2*i])
 			
 	elif doublePageReversed:
 		outputWriters = [PdfWriter() for _ in range(pagesPerDocument)]
@@ -155,50 +161,107 @@ def saveDocuments(documents, directory):
 	
 	
 		
+def printToPDF(input_file, output_file):
+    """
+    Optimizes a PDF using Ghostscript to reduce file size and remove content outside cropbox.
+    """
+    try:
+        # Use Ghostscript to optimize the PDF
+        subprocess.run([
+            'gs',
+            '-sDEVICE=pdfwrite',
+            '-dCompatibilityLevel=1.4',
+            '-dPDFSETTINGS=/printer',  # High quality but with optimization
+            '-dNOPAUSE',
+            '-dQUIET',
+            '-dBATCH',
+            '-dAutoRotatePages=/None',
+            '-sOutputFile=' + output_file,
+            input_file
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        raise Exception(f"Failed to optimize PDF: {str(e)}")
+    except Exception as e:
+        raise e
+
 def unscramble(filename, pagesPerDocument, isBooklet, split, rearrange, doublePage, doublePageReversed):
-	pdf = open(filename, "rb")
-	document = PdfReader(pdf)
-	document2 = PdfReader(pdf)
-	
-	directory = os.path.splitext(filename)[0]
-	
-	if rearrange:
-		if isBooklet:
+	pdf1 = open(filename, "rb")
+	pdf2 = open(filename, "rb")
+	try:
+		document = PdfReader(pdf1)
+		document2 = PdfReader(pdf2)
+		
+		directory = os.path.splitext(filename)[0]
+		
+		if rearrange:
+			if isBooklet:
+				document = splitA3Booklet(document, document2, pagesPerDocument)
+				pagesPerDocument *= 2
+			
+			if split:
+				documents = scramble(document, pagesPerDocument, split=True, doublePageReversed=doublePageReversed)
+				saveDocuments(documents, directory)
+				# Print each document to PDF
+				for i, doc in enumerate(documents):
+					temp_input = f"{directory}/temp_{i}.pdf"
+					with open(temp_input, "wb") as f:
+						doc.write(f)
+					printToPDF(temp_input, f"{directory}/document_{i+1}.pdf")
+					os.unlink(temp_input)
+			else:
+				if doublePage and doublePageReversed:
+					raise Exception("The -d and -dr options cannot both be selected.")
+				elif doublePage:
+					document = scramble(document, pagesPerDocument, doublePage=doublePage)
+				elif doublePageReversed:
+					document = scramble(document, pagesPerDocument, doublePageReversed=doublePageReversed)
+				else:
+					document = scramble(document, pagesPerDocument)
+				
+				# Save to temporary file and print to PDF
+				temp_input = f"{directory}_temp.pdf"
+				with open(temp_input, "wb") as f:
+					document.write(f)
+				printToPDF(temp_input, f"{directory}_output.pdf")
+				os.unlink(temp_input)
+				
+		elif isBooklet:
 			document = splitA3Booklet(document, document2, pagesPerDocument)
 			pagesPerDocument *= 2
-		
-		if split:
-			documents = scramble(document, pagesPerDocument, split=True, doublePageReversed=doublePageReversed)
-			saveDocuments(documents, directory)
-		else:
-			if doublePage and doublePageReversed:
-				raise Exception("The -d and -dr options cannot both be selected.")
-			elif doublePage:
-				document = scramble(document, pagesPerDocument, doublePage=doublePage)
-			elif doublePageReversed:
-				document = scramble(document, pagesPerDocument, doublePageReversed=doublePageReversed)
+			
+			if split:
+				documents = splitPDF(document, pagesPerDocument)
+				saveDocuments(documents, directory)
+				# Print each document to PDF
+				for i, doc in enumerate(documents):
+					temp_input = f"{directory}/temp_{i}.pdf"
+					with open(temp_input, "wb") as f:
+						doc.write(f)
+					printToPDF(temp_input, f"{directory}/document_{i+1}.pdf")
+					os.unlink(temp_input)
 			else:
-				document = scramble(document, pagesPerDocument)
-			
-			with open(f"{directory}_output.pdf", "wb") as output:
-				document.write(output)
-			
-	elif isBooklet:
-		document = splitA3Booklet(document, document2, pagesPerDocument)
-		pagesPerDocument *= 2
-		
-		if split:
+				# Save to temporary file and print to PDF
+				temp_input = f"{directory}_temp.pdf"
+				with open(temp_input, "wb") as f:
+					document.write(f)
+				printToPDF(temp_input, f"{directory}_output.pdf")
+				os.unlink(temp_input)
+					
+		elif split:
 			documents = splitPDF(document, pagesPerDocument)
 			saveDocuments(documents, directory)
+			# Print each document to PDF
+			for i, doc in enumerate(documents):
+				temp_input = f"{directory}/temp_{i}.pdf"
+				with open(temp_input, "wb") as f:
+					doc.write(f)
+				printToPDF(temp_input, f"{directory}/document_{i+1}.pdf")
+				os.unlink(temp_input)
 		else:
-			with open(f"{directory}_output.pdf", "wb") as output:
-				document.write(output)
-				
-	elif split:
-		documents = splitPDF(document, pagesPerDocument)
-		saveDocuments(documents, directory)
-	else:
-		raise Exception("You must select at least one option: -r, -s, or -b.")
+			raise Exception("You must select at least one option: -r, -s, or -b.")
+	finally:
+		pdf1.close()
+		pdf2.close()
 
 def main():
 	parser = argparse.ArgumentParser()
